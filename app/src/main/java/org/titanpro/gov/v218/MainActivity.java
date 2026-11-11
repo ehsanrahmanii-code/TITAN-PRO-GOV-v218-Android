@@ -40,6 +40,7 @@ public class MainActivity extends AppCompatActivity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private int loadAttempts = 0;
     private boolean pageOk = false;
+    private boolean loadLoopRunning = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -55,6 +56,7 @@ public class MainActivity extends AppCompatActivity {
         s.setUseWideViewPort(true);
         s.setBuiltInZoomControls(false);
         s.setMediaPlaybackRequiresUserGesture(false);
+        s.setCacheMode(WebSettings.LOAD_NO_CACHE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             s.setSafeBrowsingEnabled(false);
         }
@@ -62,18 +64,36 @@ public class MainActivity extends AppCompatActivity {
         webView.setWebViewClient(new WebViewClient() {
             @Override
             public void onPageFinished(WebView view, String url) {
-                pageOk = true;
-                injectNotificationBridge();
+                if (url != null && url.startsWith("http://127.0.0.1:8080")) {
+                    pageOk = true;
+                    injectNotificationBridge();
+                }
             }
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
-                if (request != null && request.isForMainFrame()) pageOk = false;
+                if (request != null && request.isForMainFrame()) {
+                    pageOk = false;
+                }
             }
         });
         webView.addJavascriptInterface(new NotifyBridge(), "TitanNative");
-        showBootHtml("در حال روشن شدن موتور TITAN PRO GOV v2.1.8 CALIBRATED…\n۳۰–۹۰ ثانیه صبر کنید.\nمجوز دسترسی به همه فایل‌ها را تأیید کنید تا پوشه XXX ساخته شود.");
+        showBootHtml("در حال روشن شدن موتور TITAN PRO GOV v2.1.8…\n۳۰–۹۰ ثانیه صبر کنید.\nمجوز All files را بدهید تا پوشه XXX ساخته شود.");
         startPythonServer();
-        scheduleLoad();
+        startLoadLoop();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // After leaving the app the server thread may have died — restart + reload
+        startPythonServer();
+        if (!pageOk) {
+            showBootHtml("در حال اتصال مجدد به موتور…");
+            loadAttempts = 0;
+            startLoadLoop();
+        } else if (webView != null) {
+            webView.reload();
+        }
     }
 
     private void showBootHtml(String msg) {
@@ -84,7 +104,9 @@ public class MainActivity extends AppCompatActivity {
                 + "box-shadow:0 0 24px #00f0ff33}</style></head>"
                 + "<body><div class='c'><h3 style='color:#00f0ff;text-shadow:0 0 12px #00f0ff'>Titan PRO GOV v2.1.8 Neon</h3><pre style='white-space:pre-wrap'>" + msg
                 + "</pre></div></body></html>";
-        webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null);
+        if (webView != null) {
+            webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null);
+        }
     }
 
     private void createNotificationChannel() {
@@ -164,27 +186,51 @@ public class MainActivity extends AppCompatActivity {
     private void startPythonServer() {
         new Thread(() -> {
             try {
-                if (!Python.isStarted()) Python.start(new AndroidPlatform(getApplicationContext()));
-                Python.getInstance().getModule("android_main").callAttr("start_server");
-                handler.post(() -> Toast.makeText(MainActivity.this, "موتور Titan PRO GOV v2.1.8 شروع شد", Toast.LENGTH_SHORT).show());
+                if (!Python.isStarted()) {
+                    Python.start(new AndroidPlatform(getApplicationContext()));
+                }
+                // ensure_server restarts if port died
+                Object status = Python.getInstance().getModule("android_main").callAttr("ensure_server");
+                final String st = status != null ? status.toString() : "?";
+                handler.post(() -> Toast.makeText(MainActivity.this, "موتور: " + st, Toast.LENGTH_SHORT).show());
             } catch (Exception e) {
                 e.printStackTrace();
                 final String msg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
                 handler.post(() -> {
                     Toast.makeText(MainActivity.this, "Server error: " + msg, Toast.LENGTH_LONG).show();
-                    showBootHtml("خطای پایتون:\n" + msg);
+                    showBootHtml("خطای پایتون:\n" + msg + "\n\nForce Stop کنید و دوباره باز کنید.");
                 });
             }
         }, "titan-python").start();
     }
 
-    private void scheduleLoad() { handler.postDelayed(this::tryLoad, 5000); }
+    private void startLoadLoop() {
+        if (loadLoopRunning) return;
+        loadLoopRunning = true;
+        loadAttempts = 0;
+        handler.postDelayed(this::tryLoad, 4000);
+    }
 
     private void tryLoad() {
         loadAttempts++;
-        if (!pageOk || loadAttempts <= 3) webView.loadUrl(DASHBOARD_URL);
-        if (loadAttempts < 40) handler.postDelayed(this::tryLoad, 3000);
-        else if (!pageOk) showBootHtml("سرور پاسخ نداد. Force Stop کنید و دوباره باز کنید.\nپوشه XXX را در حافظه داخلی بررسی کنید.");
+        if (!pageOk) {
+            if (webView != null) {
+                webView.clearCache(true);
+                webView.loadUrl(DASHBOARD_URL);
+            }
+            // every 5 failed attempts, nudge the server again
+            if (loadAttempts % 5 == 0) {
+                startPythonServer();
+            }
+        }
+        if (loadAttempts < 50 && !pageOk) {
+            handler.postDelayed(this::tryLoad, 2500);
+        } else {
+            loadLoopRunning = false;
+            if (!pageOk) {
+                showBootHtml("سرور پاسخ نداد.\n1) Force Stop برنامه\n2) دوباره باز کنید\n3) مجوز All files را چک کنید\n\nلاگ: /storage/emulated/0/XXX/titan_boot.log");
+            }
+        }
     }
 
     @Override
